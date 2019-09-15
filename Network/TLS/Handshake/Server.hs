@@ -452,20 +452,20 @@ doHandshake sparams mcred ctx chosenVersion usedCipher usedCompression clientSes
 --
 
 -- Expected packet
-data ExpPacket = EpEitherCertOrCliKeyXchg
-               | RcdCertificates
-               | RcdCliKeyXchg
-               | RcdEitherCertVerifyOrChangeCipherSpec
-               | RcdCertVerify
-               | RcdChangeCipherSpec
-               | RcdFinished
+data ExpPacket = EpCertOrCliKeyXchg
+               | EpCert
+               | EpCliKeyXchg
+               | EpCertVerifyOrChangeCipherSpec
+               | EpCertVerify
+               | EpChangeCipherSpec
+               | EpFinished
                deriving Show
 
 
 -- FIXME: this is where we chime in
 recvClientData :: ServerParams -> Context -> IO ()
 recvClientData sparams ctx = do
-  dispatch (sparams, ctx) EpEitherCertOrCliKeyXchg Nothing
+  dispatch (sparams, ctx) EpCertOrCliKeyXchg Nothing
   -- recvClientData' sparams ctx
 
 
@@ -481,60 +481,55 @@ dispatch ps@(_, ctx) st Nothing = do
 
 dispatch ps st (Just (Handshake [])) = dispatch ps st Nothing
 
-dispatch sp EpEitherCertOrCliKeyXchg
-            (Just (Handshake hss)) = do
-  putStrLn "RcdEitherCertOrCliKeyXchg"
-  case hss of
-    Certificates _:_ -> dispatch sp RcdCertificates (Just $ Handshake hss)
-    ClientKeyXchg _:_ -> dispatch sp RcdCliKeyXchg (Just $ Handshake hss)
-    _ -> unexpected (show hss) (Just "certificates or client key exchange")
+dispatch ps st@EpCertOrCliKeyXchg (Just hs@(Handshake (Certificates _:_))) = do
+  putStrLn $ show st
+  dispatch ps EpCert (Just hs)
+dispatch ps st@EpCertOrCliKeyXchg (Just hs@(Handshake (ClientKeyXchg _:_))) = do
+  putStrLn $ show st
+  dispatch ps EpCliKeyXchg (Just hs)
 
-dispatch ps@(_, ctx) RcdCertificates (Just (Handshake hss)) = do
-  putStrLn "RcdCert"
-  case hss of
-    cs@(Certificates certs):hs -> do
-      processClientCertificate ps certs
-      processHandshake ctx cs
-      dispatch ps RcdCliKeyXchg (Just $ Handshake hs)
-    _ -> unexpected (show hss) (Just "certificates")
+dispatch ps@(_, ctx) st@EpCert (Just (Handshake (cs@(Certificates certs):hs))) = do
+  putStrLn $ show st
+  processClientCertificate ps certs
+  processHandshake ctx cs
+  dispatch ps EpCliKeyXchg (Just $ Handshake hs)
 
-dispatch sp@(_, ctx) RcdCliKeyXchg (Just (Handshake hss)) = do
-  putStrLn "RcdCliKeyXchg"
-  case hss of
-    dat@(ClientKeyXchg _):hs -> do
-      processHandshake ctx dat
-      dispatch sp RcdEitherCertVerifyOrChangeCipherSpec (Just $ Handshake hs)
-    _ -> unexpected (show hss) (Just "client key exchange")
+dispatch sp@(_, ctx) st@EpCliKeyXchg (Just (Handshake (dat@(ClientKeyXchg _):hs))) =
+  do putStrLn $ show st
+     processHandshake ctx dat
+     dispatch sp EpCertVerifyOrChangeCipherSpec (Just $ Handshake hs)
 
+dispatch ps st@EpCertVerifyOrChangeCipherSpec (Just p@(Handshake (CertVerify _:_))) =
+  do putStrLn $ show st
+     dispatch ps EpCertVerify $ Just p
+dispatch ps st@EpCertVerifyOrChangeCipherSpec (Just p@(ChangeCipherSpec)) = do
+  putStrLn $ show st
+  dispatch ps EpChangeCipherSpec $ Just p
 
-dispatch ps RcdEitherCertVerifyOrChangeCipherSpec (Just packet)  = do
-  putStrLn "RcdEitherCertVerifyOrChangeCipherSpec"
-  case packet of
-    Handshake (CertVerify _:_) -> dispatch ps RcdCertVerify $ Just packet
-    ChangeCipherSpec -> dispatch ps RcdChangeCipherSpec $ Just packet
-    _ -> unexpected (show packet) (Just "cert verify")
+dispatch ps@(_, ctx) st@EpCertVerify (Just (Handshake (dat@(CertVerify _):hs))) = do
+  putStrLn $ show st
+  processHandshake ctx dat
+  processCertificateVerify ps dat
+  dispatch ps EpChangeCipherSpec (Just $ Handshake hs)
 
-dispatch ps@(_, ctx) RcdCertVerify (Just packet)  = do
-  putStrLn "RcdCertVerify"
-  case packet of
-    Handshake (dat@(CertVerify _):hs) -> do
-      processHandshake ctx dat
-      processCertificateVerify ps dat
-      dispatch ps RcdChangeCipherSpec (Just $ Handshake hs)
-    _ -> unexpected (show packet) (Just "cert verify")
+dispatch sp st@EpChangeCipherSpec (Just ChangeCipherSpec) = do
+  putStrLn $ show st
+  dispatch sp EpFinished Nothing
 
-dispatch sp RcdChangeCipherSpec (Just ChangeCipherSpec) = do
-  putStrLn "RcdChangeCipherSpec"
-  dispatch sp RcdFinished Nothing
-
-dispatch (_, ctx) RcdFinished (Just (Handshake (dat@(Finished _):_))) = do
-  putStrLn "RcdFinished"
+dispatch (_, ctx) st@EpFinished (Just (Handshake (dat@(Finished _):_))) = do
+  putStrLn $ show st
   processHandshake ctx dat
 
-dispatch _ st packet = unexpected (show packet) (Just $ "at " ++ show st)
+dispatch _ st (Just packet) = unexpected (show packet) (Just $ expPacketToMsg st)
 
 expPacketToMsg :: ExpPacket -> String
-expPacketToMsg = undefined
+expPacketToMsg EpCertOrCliKeyXchg = "certificates or client key exchange"
+expPacketToMsg EpCert = "certificate"
+expPacketToMsg EpCliKeyXchg = "client key exchange"
+expPacketToMsg EpCertVerifyOrChangeCipherSpec = "cert verify or change cipher spec"
+expPacketToMsg EpCertVerify = "cert verify"
+expPacketToMsg EpChangeCipherSpec = "change cipher spec"
+expPacketToMsg EpFinished = "finished"
 
 ----------
 processClientCertificate :: (ServerParams, Context) -> CertificateChain -> IO ()
@@ -627,109 +622,109 @@ processCertificateVerify (_, ctx) _ = do
 
 
 
-recvClientData' :: ServerParams -> Context -> IO ()
-recvClientData' sparams ctx = runRecvState ctx (RecvStateHandshake processClientCertificate)
-  where processClientCertificate (Certificates certs) = do
-            -- run certificate recv hook
-            ctxWithHooks ctx (\hooks -> hookRecvCertificates hooks certs)
-            -- Call application callback to see whether the
-            -- certificate chain is acceptable.
-            --
-            usage <- liftIO $ catchException (onClientCertificate (serverHooks sparams) certs) rejectOnException
-            case usage of
-                CertificateUsageAccept        -> return ()
-                CertificateUsageReject reason -> certificateRejected reason
+-- recvClientData' :: ServerParams -> Context -> IO ()
+-- recvClientData' sparams ctx = runRecvState ctx (RecvStateHandshake processClientCertificate)
+--   where processClientCertificate (Certificates certs) = do
+--             -- run certificate recv hook
+--             ctxWithHooks ctx (\hooks -> hookRecvCertificates hooks certs)
+--             -- Call application callback to see whether the
+--             -- certificate chain is acceptable.
+--             --
+--             usage <- liftIO $ catchException (onClientCertificate (serverHooks sparams) certs) rejectOnException
+--             case usage of
+--                 CertificateUsageAccept        -> return ()
+--                 CertificateUsageReject reason -> certificateRejected reason
 
-            -- Remember cert chain for later use.
-            --
-            usingHState ctx $ setClientCertChain certs
+--             -- Remember cert chain for later use.
+--             --
+--             usingHState ctx $ setClientCertChain certs
 
-            -- FIXME: We should check whether the certificate
-            -- matches our request and that we support
-            -- verifying with that certificate.
+--             -- FIXME: We should check whether the certificate
+--             -- matches our request and that we support
+--             -- verifying with that certificate.
 
-            return $ RecvStateHandshake processClientKeyExchange
+--             return $ RecvStateHandshake processClientKeyExchange
 
-        processClientCertificate p = processClientKeyExchange p
+--         processClientCertificate p = processClientKeyExchange p
 
-        -- cannot use RecvStateHandshake, as the next message could be a ChangeCipher,
-        -- so we must process any packet, and in case of handshake call processHandshake manually.
-        processClientKeyExchange (ClientKeyXchg _) = return $ RecvStateNext processCertificateVerify
-        processClientKeyExchange p                 = unexpected (show p) (Just "client key exchange")
+--         -- cannot use RecvStateHandshake, as the next message could be a ChangeCipher,
+--         -- so we must process any packet, and in case of handshake call processHandshake manually.
+--         processClientKeyExchange (ClientKeyXchg _) = return $ RecvStateNext processCertificateVerify
+--         processClientKeyExchange p                 = unexpected (show p) (Just "client key exchange")
 
-        -- Check whether the client correctly signed the handshake.
-        -- If not, ask the application on how to proceed.
-        --
-        processCertificateVerify (Handshake [hs@(CertVerify dsig)]) = do
-            processHandshake ctx hs
+--         -- Check whether the client correctly signed the handshake.
+--         -- If not, ask the application on how to proceed.
+--         --
+--         processCertificateVerify (Handshake [hs@(CertVerify dsig)]) = do
+--             processHandshake ctx hs
 
-            checkValidClientCertChain "change cipher message expected"
+--             checkValidClientCertChain "change cipher message expected"
 
-            usedVersion <- usingState_ ctx getVersion
-            -- Fetch all handshake messages up to now.
-            msgs  <- usingHState ctx $ B.concat <$> getHandshakeMessages
+--             usedVersion <- usingState_ ctx getVersion
+--             -- Fetch all handshake messages up to now.
+--             msgs  <- usingHState ctx $ B.concat <$> getHandshakeMessages
 
-            sigAlgExpected <- getRemoteSignatureAlg
+--             sigAlgExpected <- getRemoteSignatureAlg
 
-            -- FIXME should check certificate is allowed for signing
+--             -- FIXME should check certificate is allowed for signing
 
-            verif <- checkCertificateVerify ctx usedVersion sigAlgExpected msgs dsig
+--             verif <- checkCertificateVerify ctx usedVersion sigAlgExpected msgs dsig
 
-            if verif then do
-                -- When verification succeeds, commit the
-                -- client certificate chain to the context.
-                --
-                Just certs <- usingHState ctx getClientCertChain
-                usingState_ ctx $ setClientCertificateChain certs
-                return ()
-              else do
-                -- Either verification failed because of an
-                -- invalid format (with an error message), or
-                -- the signature is wrong.  In either case,
-                -- ask the application if it wants to
-                -- proceed, we will do that.
-                res <- liftIO $ onUnverifiedClientCert (serverHooks sparams)
-                if res then do
-                        -- When verification fails, but the
-                        -- application callbacks accepts, we
-                        -- also commit the client certificate
-                        -- chain to the context.
-                        Just certs <- usingHState ctx getClientCertChain
-                        usingState_ ctx $ setClientCertificateChain certs
-                    else throwCore $ Error_Protocol ("verification failed", True, BadCertificate)
-            return $ RecvStateNext expectChangeCipher
+--             if verif then do
+--                 -- When verification succeeds, commit the
+--                 -- client certificate chain to the context.
+--                 --
+--                 Just certs <- usingHState ctx getClientCertChain
+--                 usingState_ ctx $ setClientCertificateChain certs
+--                 return ()
+--               else do
+--                 -- Either verification failed because of an
+--                 -- invalid format (with an error message), or
+--                 -- the signature is wrong.  In either case,
+--                 -- ask the application if it wants to
+--                 -- proceed, we will do that.
+--                 res <- liftIO $ onUnverifiedClientCert (serverHooks sparams)
+--                 if res then do
+--                         -- When verification fails, but the
+--                         -- application callbacks accepts, we
+--                         -- also commit the client certificate
+--                         -- chain to the context.
+--                         Just certs <- usingHState ctx getClientCertChain
+--                         usingState_ ctx $ setClientCertificateChain certs
+--                     else throwCore $ Error_Protocol ("verification failed", True, BadCertificate)
+--             return $ RecvStateNext expectChangeCipher
 
-        processCertificateVerify p = do
-            chain <- usingHState ctx getClientCertChain
-            case chain of
-                Just cc | isNullCertificateChain cc -> return ()
-                        | otherwise                 -> throwCore $ Error_Protocol ("cert verify message missing", True, UnexpectedMessage)
-                Nothing -> return ()
-            expectChangeCipher p
+--         processCertificateVerify p = do
+--             chain <- usingHState ctx getClientCertChain
+--             case chain of
+--                 Just cc | isNullCertificateChain cc -> return ()
+--                         | otherwise                 -> throwCore $ Error_Protocol ("cert verify message missing", True, UnexpectedMessage)
+--                 Nothing -> return ()
+--             expectChangeCipher p
 
-        getRemoteSignatureAlg = do
-            pk <- usingHState ctx getRemotePublicKey
-            case pk of
-                PubKeyRSA _   -> return RSA
-                PubKeyDSA _   -> return DSS
-                PubKeyEC  _   -> return ECDSA
-                _             -> throwCore $ Error_Protocol ("unsupported remote public key type", True, HandshakeFailure)
+--         getRemoteSignatureAlg = do
+--             pk <- usingHState ctx getRemotePublicKey
+--             case pk of
+--                 PubKeyRSA _   -> return RSA
+--                 PubKeyDSA _   -> return DSS
+--                 PubKeyEC  _   -> return ECDSA
+--                 _             -> throwCore $ Error_Protocol ("unsupported remote public key type", True, HandshakeFailure)
 
-        expectChangeCipher ChangeCipherSpec = do
-            return $ RecvStateHandshake expectFinish
+--         expectChangeCipher ChangeCipherSpec = do
+--             return $ RecvStateHandshake expectFinish
 
-        expectChangeCipher p                = unexpected (show p) (Just "change cipher")
+--         expectChangeCipher p                = unexpected (show p) (Just "change cipher")
 
-        expectFinish (Finished _) = return RecvStateDone
-        expectFinish p            = unexpected (show p) (Just "Handshake Finished")
+--         expectFinish (Finished _) = return RecvStateDone
+--         expectFinish p            = unexpected (show p) (Just "Handshake Finished")
 
-        checkValidClientCertChain msg = do
-            chain <- usingHState ctx getClientCertChain
-            let throwerror = Error_Protocol (msg , True, UnexpectedMessage)
-            case chain of
-                Nothing -> throwCore throwerror
-                Just cc | isNullCertificateChain cc -> throwCore throwerror
-                        | otherwise                 -> return ()
+--         checkValidClientCertChain msg = do
+--             chain <- usingHState ctx getClientCertChain
+--             let throwerror = Error_Protocol (msg , True, UnexpectedMessage)
+--             case chain of
+--                 Nothing -> throwCore throwerror
+--                 Just cc | isNullCertificateChain cc -> throwCore throwerror
+--                         | otherwise                 -> return ()
 
 hashAndSignaturesInCommon :: Context -> [ExtensionRaw] -> [HashAndSignatureAlgorithm]
 hashAndSignaturesInCommon ctx exts =
