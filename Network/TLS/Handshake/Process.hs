@@ -34,6 +34,7 @@ import Data.X509 (CertificateChain(..), Certificate(..), getCertificate)
 
 processHandshake :: Context -> Handshake -> IO ()
 processHandshake ctx hs = do
+    -- putStrLn $ "-------------- processHandshake with: " ++ (take 32 $ show hs)
     role <- usingState_ ctx isClientContext
     case hs of
         ClientHello cver ran _ cids _ ex _ -> when (role == ServerRole) $ do
